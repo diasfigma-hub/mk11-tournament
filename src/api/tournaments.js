@@ -1,6 +1,7 @@
 import { getSupabase } from '@/lib/supabase'
 
 const TABLE = 'tournaments'
+const PUBLIC_VIEW = 'public_tournaments'
 
 function toTournament(row) {
   if (!row) return null
@@ -68,6 +69,23 @@ export const tournamentsApi = {
 
   async getById(id) {
     const { data, error } = await getSupabase().from(TABLE).select('*').eq('id', id).maybeSingle()
+    if (error) throw toError(error, 'Не удалось загрузить турнир.')
+    return toTournament(data)
+  },
+
+  // Публичные страницы читают безопасную проекцию без ФИО и служебных полей.
+  async getPublicAll() {
+    const { data, error } = await getSupabase().from(PUBLIC_VIEW).select('*')
+    if (error) throw toError(error, 'Не удалось загрузить список турниров.')
+    return sortByDate((data || []).map(toTournament))
+  },
+
+  async getPublicById(id) {
+    const { data, error } = await getSupabase()
+      .from(PUBLIC_VIEW)
+      .select('*')
+      .eq('id', id)
+      .maybeSingle()
     if (error) throw toError(error, 'Не удалось загрузить турнир.')
     return toTournament(data)
   },

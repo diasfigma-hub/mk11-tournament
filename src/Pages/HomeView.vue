@@ -15,7 +15,7 @@ const statsError = ref('')
 onMounted(async () => {
   const [players, events] = await Promise.allSettled([
     participantsApi.count(),
-    tournamentsApi.getAll(),
+    tournamentsApi.getPublicAll(),
   ])
   if (players.status === 'fulfilled') fightersCount.value = players.value
   if (events.status === 'fulfilled') tournaments.value = events.value

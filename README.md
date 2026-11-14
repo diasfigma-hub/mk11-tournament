@@ -120,8 +120,115 @@ VITE_SUPABASE_ANON_KEY=your-anon-key
 - **Персонажи** ограничены CHECK-констрейнтом 24 базовыми бойцами; DLC вставить нельзя.
 - **Закрытие регистрации** проверяется в RLS-политике `INSERT`: при закрытом лобби
   заявка отклоняется даже при ручном запросе к API.
-- **Турниры и статус регистрации** читаются публично, но меняются только админом.
+- **Публичный API турниров** читает представление `public_tournaments`: только ник, персонаж, сетка и результаты. ФИО и контакты в него не попадают. Базовая таблица `tournaments` доступна только администратору.
 - Пароль администратора хранится в Supabase Auth, в клиентском коде его нет.
+
+## Миграция безопасности для существующей базы
+
+Если база Supabase уже создана, выполните в SQL Editor файл
+[`supabase/security_hardening.sql`](supabase/security_hardening.sql) от имени
+владельца таблиц (роль `postgres`). Скрипт не удаляет таблицы и строки, не
+меняет существующие JSON-снимки и ID, не трогает дизайн сайта. Повторный запуск
+безопасен.
+
+### Что меняется
+
+- Публичные страницы читают представления `public_tournaments` и
+  `public_settings`. Базовая таблица `tournaments` и `settings` доступна только
+  администратору; `anon` не может их читать, менять или удалять.
+- Перед публикацией JSON очищается рекурсивно: удаляются `fullName`, `contact`,
+  `email`, `phone`, мессенджеры и даты рождения на любой глубине.
+- Внутренние числовые ID (`id`, `winnerId`, `p1`/`p2`) заменяются на стабильные
+  псевдонимы — усечённый HMAC-SHA256 с секретным ключом. Обычный `md5` с
+  постоянным префиксом не годится: последовательные ID перебираются мгновенно.
+  Ключ хранится в закрытой таблице `app_secrets`, поэтому псевдонимы стабильны
+  между запусками и одинаковы во всех полях сетки.
+- Очищенные копии JSON (`public_players`, `public_rounds`, `public_third_place`,
+  `public_champion`) пересчитываются триггером при каждой записи турнира.
+  Представление не вызывает функций, поэтому `anon` не получает `EXECUTE` на
+  очистку и не может использовать её как оракул «ID → псевдоним».
+- Проверка «регистрация открыта» вынесена в `registration_open()`:
+  RLS-политика `INSERT` больше не читает `settings` от имени анонима, иначе
+  регистрация падала бы после отзыва `SELECT`.
+- Публичный `SELECT` на `participants` по-прежнему закрыт, `RETURNING` для
+  анонима недоступен. `supabase-js` без `.select()` его не запрашивает.
+- Турниры и `settings` исключаются из публикации Realtime: она отдаёт строку
+  целиком, обходя колонки представления.
+- `is_published` (по умолчанию `true`) позволяет скрыть турнир из публичного API,
+  не удаляя его: `update public.tournaments set is_published = false where id = …`.
+  Статус `draft` намеренно остаётся публичным: в этом проекте это «Набор
+  участников» с открытой регистрацией, он есть в фильтре `/tournaments` и в
+  блоке «Ближайшие турниры» на главной.
+
+### Проверка после применения
+
+```sql
+select has_table_privilege('anon', 'public.tournaments', 'SELECT');        -- false
+select has_table_privilege('anon', 'public.settings', 'SELECT');           -- false
+select has_table_privilege('anon', 'public.public_tournaments', 'SELECT'); -- true
+select has_table_privilege('anon', 'public.tournaments', 'UPDATE');        -- false
+select has_function_privilege('anon', 'public.public_tournament_json(jsonb)', 'EXECUTE'); -- false
+select * from public.public_tournaments;  -- JSON без ФИО и контактов
+```
+
+Полный чек-лист (политики, доступные `anon` функции, публикация Realtime)
+приведён в конце `supabase/security_hardening.sql`.
+
+### Откат
+
+[`supabase/security_hardening_rollback.sql`](supabase/security_hardening_rollback.sql)
+возвращает прежние `GRANT` и RLS-политики, удаляет представления, функции,
+триггер и служебные колонки. Таблицы, строки, ID и исходные JSON не трогаются.
+Учтите: после отката ФИО снова станут публичными, а фронтенд нужно вернуть на
+прямое чтение таблиц.
+
+### Совместимость
+
+Скрипт рассчитан на PostgreSQL 12+ (Supabase использует 15/17) и не применяет
+синтаксис новее 12-й версии. Нужен `pgcrypto` в схеме `extensions` — в Supabase
+он установлен по умолчанию; при отсутствии скрипт остановится с понятной
+ошибкой до внесения изменений.
+
+### Порядок применения
+
+1. Сделайте резервную копию: Supabase → Database → Backups (или `pg_dump` по
+   строке подключения). Миграция данные не меняет, но копия обязательна.
+2. Откройте SQL Editor и выполните [`supabase/migration_checks.sql`](supabase/migration_checks.sql),
+   часть A. Ожидается: роль `postgres`, PostgreSQL 12+, `pgcrypto` в схеме
+   `extensions`, владелец всех таблиц — `postgres`, представлений ещё нет.
+   Скрипт только читает каталог.
+3. Выполните целиком [`supabase/security_hardening.sql`](supabase/security_hardening.sql)
+   в том же SQL Editor. Скрипт идёт одной транзакцией: при любой ошибке не
+   применяется ничего. На существующей базе это секунды.
+4. Выполните часть B файла `migration_checks.sql`: базовые таблицы закрыты,
+   представления читаются, `public_*` без ФИО, `anon` не вызывает служебные
+   функции, турниров и `settings` нет в публикации Realtime.
+5. Проверьте REST (подставьте свой URL и anon-ключ):
+
+   ```bash
+   curl -i "$VITE_SUPABASE_URL/rest/v1/tournaments?select=*" \
+     -H "apikey: $VITE_SUPABASE_ANON_KEY"      # 401 permission denied
+   curl -i "$VITE_SUPABASE_URL/rest/v1/participants?select=*" \
+     -H "apikey: $VITE_SUPABASE_ANON_KEY"      # 401 permission denied
+   curl -i "$VITE_SUPABASE_URL/rest/v1/public_tournaments?select=*" \
+     -H "apikey: $VITE_SUPABASE_ANON_KEY"      # 200, в JSON нет fullName
+   curl -i "$VITE_SUPABASE_URL/rest/v1/public_settings?select=*" \
+     -H "apikey: $VITE_SUPABASE_ANON_KEY"      # 200
+   ```
+
+6. Проверьте интерфейс: главная, `/tournaments`, страница турнира, отправка
+   заявки, затем вход в `/admin`, создание турнира, жеребьёвка, ввод счёта,
+   список участников и переключатель регистрации.
+7. Только после этого коммитьте, пушьте и деплойте фронтенд: новый код читает
+   `public_tournaments`/`public_settings`, которых до миграции не существует.
+
+> **Важно про порядок.** Публичные страницы в текущем коде уже обращаются к
+> представлениям. Если задеплоить фронтенд раньше миграции, `/tournaments`
+> покажет ошибку, а страница турнира — «Турнир не найден». Сначала SQL, потом деплой.
+>
+> Если после миграции REST всё ещё отдаёт 404 на `public_tournaments`, обновите
+> кэш схемы: SQL уже шлёт `notify pgrst, 'reload schema'`; повторно —
+> Settings → API → Reload schema или `NOTIFY pgrst, 'reload schema';`.
 
 ## Переход с mokky.dev
 

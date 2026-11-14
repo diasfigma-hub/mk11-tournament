@@ -1,6 +1,7 @@
 import { getSupabase } from '@/lib/supabase'
 
 const TABLE = 'settings'
+const PUBLIC_VIEW = 'public_settings'
 
 function toError(error, fallback) {
   const result = new Error(fallback)
@@ -11,9 +12,8 @@ function toError(error, fallback) {
 export const settingsApi = {
   async getRegistrationClosed() {
     const { data, error } = await getSupabase()
-      .from(TABLE)
+      .from(PUBLIC_VIEW)
       .select('registration_closed')
-      .eq('id', 1)
       .maybeSingle()
 
     if (error) throw toError(error, 'Не удалось проверить статус регистрации.')

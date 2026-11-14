@@ -24,7 +24,7 @@ async function load() {
   loading.value = true
   error.value = ''
   try {
-    tournaments.value = await tournamentsApi.getAll()
+    tournaments.value = await tournamentsApi.getPublicAll()
   } catch {
     error.value = 'Не удалось загрузить список турниров. Попробуйте обновить страницу.'
   } finally {

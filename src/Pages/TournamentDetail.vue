@@ -17,7 +17,7 @@ const registrationClosed = ref(false)
 
 onMounted(async () => {
   const [event, closed] = await Promise.allSettled([
-    tournamentsApi.getById(route.params.id),
+    tournamentsApi.getPublicById(route.params.id),
     settingsApi.getRegistrationClosed(),
   ])
 

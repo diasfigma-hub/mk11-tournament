@@ -1,7 +1,10 @@
 -- MK11 Arena — схема Supabase.
 -- Выполните этот файл в Supabase → SQL Editor на чистом проекте.
--- Скрипт создаёт таблицы, ограничения, RLS-политики и публичный счётчик участников.
--- Повторный запуск безопасен: таблицы/индексы создаются с IF NOT EXISTS, политики пересоздаются.
+-- Скрипт создаёт таблицы, ограничения, RLS-политики, публичные представления и
+-- счётчик участников. Повторный запуск безопасен: таблицы/индексы создаются с
+-- IF NOT EXISTS, функции заменяются, представления и политики пересоздаются.
+--
+-- Для уже существующей базы используйте supabase/security_hardening.sql.
 
 -- ── Участники ────────────────────────────────────────────────────────────────
 
@@ -59,6 +62,13 @@ create table if not exists public.tournaments (
   rounds jsonb not null default '[]'::jsonb,
   third_place jsonb,
   champion jsonb,
+  -- Очищенные копии JSON для публичного представления (см. триггер ниже).
+  public_players jsonb,
+  public_rounds jsonb,
+  public_third_place jsonb,
+  public_champion jsonb,
+  -- false скрывает турнир из публичного представления, не удаляя его.
+  is_published boolean not null default true,
   registration_closed boolean not null default false,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
@@ -102,12 +112,31 @@ alter table public.participants enable row level security;
 alter table public.tournaments enable row level security;
 alter table public.settings enable row level security;
 
-revoke all on table public.participants from anon, authenticated;
-revoke all on table public.tournaments from anon, authenticated;
-revoke all on table public.settings from anon, authenticated;
+revoke all on table public.participants from public, anon, authenticated;
+revoke all on table public.tournaments from public, anon, authenticated;
+revoke all on table public.settings from public, anon, authenticated;
 
 grant usage on schema public to anon, authenticated;
-grant usage, select on all sequences in schema public to anon, authenticated;
+
+-- Последовательности: только необходимое. USAGE на participants.id нужен
+-- анонимной заявке, USAGE на tournaments.id — администратору при создании
+-- турнира. SELECT на последовательности приложению не требуется.
+do $sequences$
+declare
+  v_participants_seq text := pg_get_serial_sequence('public.participants', 'id');
+  v_tournaments_seq text := pg_get_serial_sequence('public.tournaments', 'id');
+begin
+  if v_participants_seq is null or v_tournaments_seq is null then
+    raise exception 'Не найдены identity-последовательности public.participants/public.tournaments.';
+  end if;
+
+  revoke select on all sequences in schema public from public, anon, authenticated;
+  revoke usage on all sequences in schema public from anon, authenticated;
+
+  execute format('grant usage on sequence %s to anon, authenticated', v_participants_seq);
+  execute format('grant usage on sequence %s to authenticated', v_tournaments_seq);
+end
+$sequences$;
 
 -- Заявку может отправить и аноним, и вошедший пользователь (например, если
 -- организатор в этом же браузере открыл публичную форму). Колонки status и
@@ -118,14 +147,12 @@ grant insert (nickname, full_name, main_character, contact)
 -- Администратор видит контакты и управляет записями.
 grant select, update, delete on public.participants to authenticated;
 
--- Турниры и настройки читаются публично, меняются только администратором.
-grant select on public.tournaments to anon;
+-- Публичное чтение турниров и настроек идёт через безопасные view ниже.
+-- Базовая таблица турниров и settings доступна только администратору.
 grant select, insert, update, delete on public.tournaments to authenticated;
-
-grant select on public.settings to anon;
 grant select, update on public.settings to authenticated;
 
--- ── RLS-политики ─────────────────────────────────────────────────────────────
+-- ── Служебные функции ────────────────────────────────────────────────────────
 
 create or replace function public.is_admin()
 returns boolean
@@ -142,6 +169,88 @@ $$;
 revoke all on function public.is_admin() from public;
 grant execute on function public.is_admin() to authenticated;
 
+-- pgcrypto нужен для HMAC-SHA256 и генерации секрета публичных ID.
+do $crypto$
+begin
+  if to_regprocedure('extensions.hmac(bytea,bytea,text)') is null then
+    create extension if not exists pgcrypto with schema extensions;
+  end if;
+end
+$crypto$;
+
+-- ── Секрет публичных идентификаторов ────────────────────────────────────────
+-- ID участников — последовательные числа. md5 с постоянным префиксом их не
+-- скрывает: перебор 1..N занимает миллисекунды. Публичный ID — усечённый
+-- HMAC-SHA256 от ID с секретным ключом из закрытой таблицы. Ключ создаётся
+-- один раз, поэтому псевдонимы стабильны между запусками.
+
+create table if not exists public.app_secrets (
+  name text primary key,
+  value text not null,
+  created_at timestamptz not null default now()
+);
+
+alter table public.app_secrets enable row level security;
+revoke all on table public.app_secrets from public, anon, authenticated;
+
+insert into public.app_secrets (name, value)
+values ('public_id_key', encode(extensions.gen_random_bytes(32), 'hex'))
+on conflict (name) do nothing;
+
+create or replace function public.public_id_key()
+returns text
+language sql
+stable
+security definer
+set search_path = pg_catalog
+as $fn$
+  select s.value
+  from public.app_secrets s
+  where s.name = 'public_id_key';
+$fn$;
+
+create or replace function public.public_token(p_value text)
+returns text
+language sql
+stable
+set search_path = pg_catalog
+as $fn$
+  select left(
+    encode(
+      extensions.hmac(
+        convert_to(p_value, 'utf8'),
+        convert_to(public.public_id_key(), 'utf8'),
+        'sha256'
+      ),
+      'hex'
+    ),
+    16
+  );
+$fn$;
+
+revoke all on function public.public_id_key() from public, anon, authenticated;
+revoke all on function public.public_token(text) from public, anon, authenticated;
+
+-- Проверка «лобби открыто» для политики INSERT. Вынесена в SECURITY DEFINER,
+-- потому что anon больше не читает settings напрямую.
+create or replace function public.registration_open()
+returns boolean
+language sql
+stable
+security definer
+set search_path = pg_catalog
+as $fn$
+  select coalesce(
+    (select s.registration_closed from public.settings s where s.id = 1),
+    false
+  ) = false;
+$fn$;
+
+revoke all on function public.registration_open() from public;
+grant execute on function public.registration_open() to anon, authenticated;
+
+-- ── RLS-политики ─────────────────────────────────────────────────────────────
+
 drop policy if exists participants_admin_select on public.participants;
 create policy participants_admin_select
   on public.participants for select
@@ -154,10 +263,7 @@ create policy participants_public_insert
   to anon, authenticated
   with check (
     status = 'accepted'
-    and coalesce(
-      (select registration_closed from public.settings where id = 1),
-      false
-    ) = false
+    and public.registration_open()
   );
 
 drop policy if exists participants_admin_update on public.participants;
@@ -174,10 +280,11 @@ create policy participants_admin_delete
   using (public.is_admin());
 
 drop policy if exists tournaments_public_select on public.tournaments;
-create policy tournaments_public_select
+drop policy if exists tournaments_admin_select on public.tournaments;
+create policy tournaments_admin_select
   on public.tournaments for select
-  to anon, authenticated
-  using (true);
+  to authenticated
+  using (public.is_admin());
 
 drop policy if exists tournaments_admin_insert on public.tournaments;
 create policy tournaments_admin_insert
@@ -199,10 +306,11 @@ create policy tournaments_admin_delete
   using (public.is_admin());
 
 drop policy if exists settings_public_select on public.settings;
-create policy settings_public_select
+drop policy if exists settings_admin_select on public.settings;
+create policy settings_admin_select
   on public.settings for select
-  to anon, authenticated
-  using (true);
+  to authenticated
+  using (public.is_admin());
 
 drop policy if exists settings_admin_update on public.settings;
 create policy settings_admin_update
@@ -210,6 +318,148 @@ create policy settings_admin_update
   to authenticated
   using (public.is_admin())
   with check (public.is_admin());
+
+-- ── Безопасная публичная проекция турниров ─────────────────────────────────
+-- Рекурсивно убирает персональные ключи и заменяет внутренние ID участников
+-- на стабильные публичные псевдонимы.
+
+create or replace function public.public_tournament_json(input jsonb)
+returns jsonb
+language plpgsql
+stable
+set search_path = pg_catalog
+as $fn$
+declare
+  result jsonb;
+begin
+  if input is null then
+    return null;
+  end if;
+
+  case jsonb_typeof(input)
+    when 'object' then
+      select coalesce(
+        jsonb_object_agg(
+          key,
+          case
+            when key in ('id', 'winnerId')
+              and jsonb_typeof(value) in ('number', 'string')
+              and (value #>> '{}') ~ '^[0-9]+$'
+              then to_jsonb(public.public_token(value #>> '{}'))
+            else public.public_tournament_json(value)
+          end
+        ),
+        '{}'::jsonb
+      )
+      into result
+      from jsonb_each(input)
+      where key not in (
+        'fullName',
+        'full_name',
+        'fullname',
+        'contact',
+        'contacts',
+        'contactInfo',
+        'email',
+        'phone',
+        'phoneNumber',
+        'phone_number',
+        'telegram',
+        'whatsapp',
+        'discord',
+        'vk',
+        'birthDate',
+        'birth_date',
+        'birthYear',
+        'birth_year',
+        'birthday',
+        'address',
+        'iin',
+        'passport'
+      );
+
+      return result;
+
+    when 'array' then
+      select coalesce(jsonb_agg(public.public_tournament_json(value)), '[]'::jsonb)
+      into result
+      from jsonb_array_elements(input);
+
+      return result;
+
+    else
+      return input;
+  end case;
+end;
+$fn$;
+
+-- Функцию вызывает только представление. Прямой вызов через RPC закрыт.
+revoke all on function public.public_tournament_json(jsonb) from public, anon, authenticated;
+
+-- Пересчёт очищенных копий при каждой записи. Триггер работает с правами
+-- владельца, поэтому читает секрет и не требует EXECUTE у клиента.
+create or replace function public.sync_public_tournament_json()
+returns trigger
+language plpgsql
+security definer
+set search_path = pg_catalog
+as $fn$
+begin
+  new.public_players := public.public_tournament_json(new.players);
+  new.public_rounds := public.public_tournament_json(new.rounds);
+  new.public_third_place := public.public_tournament_json(new.third_place);
+  new.public_champion := public.public_tournament_json(new.champion);
+  return new;
+end;
+$fn$;
+
+revoke all on function public.sync_public_tournament_json() from public, anon, authenticated;
+
+drop trigger if exists sync_public_tournament_json on public.tournaments;
+create trigger sync_public_tournament_json
+  before insert or update on public.tournaments
+  for each row
+  execute function public.sync_public_tournament_json();
+
+-- Представление не вызывает функций: PostgreSQL проверяет их EXECUTE от имени
+-- вызывающего (anon), а выдавать его нельзя — иначе anon получил бы оракул
+-- «ID → псевдоним» и восстановил исходные номера перебором.
+drop view if exists public.public_tournaments;
+create view public.public_tournaments
+with (security_barrier = true)
+as
+select
+  t.id,
+  t.title,
+  t.description,
+  t.date,
+  t.registration_end,
+  t.player_limit,
+  t.platform,
+  t.bo,
+  t.final_bo,
+  t.format,
+  t.status,
+  t.public_players as players,
+  t.public_rounds as rounds,
+  t.public_third_place as third_place,
+  t.public_champion as champion
+from public.tournaments t
+where t.is_published;
+
+drop view if exists public.public_settings;
+create view public.public_settings
+with (security_barrier = true)
+as
+select registration_closed
+from public.settings
+where id = 1;
+
+revoke all on public.public_tournaments from public, anon, authenticated;
+revoke all on public.public_settings from public, anon, authenticated;
+
+grant select on public.public_tournaments to anon, authenticated;
+grant select on public.public_settings to anon, authenticated;
 
 -- ── Публичный счётчик участников ────────────────────────────────────────────
 -- Нужен главной странице и форме регистрации. Возвращает только число,
@@ -229,12 +479,31 @@ revoke all on function public.participant_count() from public;
 grant execute on function public.participant_count() to anon, authenticated;
 
 -- ── Realtime для админ-панели ───────────────────────────────────────────────
--- Аноним не имеет SELECT-политики на participants, поэтому изменения получает
--- только вошедший администратор.
+-- Realtime отдаёт подписчику целую строку. Турниры и settings в публикации
+-- быть не должны: в JSON турнира лежат ФИО. Аноним не имеет SELECT-политики
+-- на participants, поэтому изменения получает только администратор.
 
 do $$
 begin
   if exists (select 1 from pg_publication where pubname = 'supabase_realtime') then
+    if exists (
+      select 1 from pg_publication_tables
+      where pubname = 'supabase_realtime'
+        and schemaname = 'public'
+        and tablename = 'tournaments'
+    ) then
+      alter publication supabase_realtime drop table public.tournaments;
+    end if;
+
+    if exists (
+      select 1 from pg_publication_tables
+      where pubname = 'supabase_realtime'
+        and schemaname = 'public'
+        and tablename = 'settings'
+    ) then
+      alter publication supabase_realtime drop table public.settings;
+    end if;
+
     if not exists (
       select 1 from pg_publication_tables
       where pubname = 'supabase_realtime'
